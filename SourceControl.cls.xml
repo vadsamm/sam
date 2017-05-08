@@ -1,0 +1,622 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Export generator="Cache" version="25" zv="Cache for Windows (x86-64) 2016.2 (Build 721U)" ts="2016-09-12 12:27:35">
+<Class name="Util.SourceControl">
+<Super>%Studio.SourceControl.File</Super>
+<TimeChanged>64173,44849.482813</TimeChanged>
+<TimeCreated>64113,38662.910035</TimeCreated>
+
+<Parameter name="ExpMode">
+<Description>
+2 - export in classname.cls (udl format)
+1 - export in classname.cls.xml (compatible with cache-tort-git), 
+0 - export in classname.xml   </Description>
+<Default>2</Default>
+</Parameter>
+
+<Parameter name="ResourceName">
+<Description>
+resource name is used to wait for system event
+do not change</Description>
+<Default>searchResource</Default>
+</Parameter>
+
+<Parameter name="SourceFolder">
+<Description>
+specifies where exported files should be stored</Description>
+<Default>C:/source/</Default>
+</Parameter>
+
+<Parameter name="RefreshTime">
+<Description>
+specifies the frequency of checking for new files in the SourceFolder</Description>
+<Default>2</Default>
+</Parameter>
+
+<Method name="Init">
+<Description>
+setup control version for namespace and export all .cls, .mac, .int, .dfi files
+omits generated classes and classes with masks: %.*, csp.*, Ens.*, CSPX.*, INFORMATION.SCHEMA.*
+reponame - name of the repository.</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>reponame:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	if $g(reponame)="" s reponame=$znspace
+	// init variables and globals
+	kill ^Sources
+	set ^Sources = ..#SourceFolder_reponame_"/"_ "src" _ "/"
+	set ^Sources("CLS","*") = "cls/"
+	set ^Sources("DFI","*") = "dfi/"
+	set ^Sources("MAC","*") = "mac/"
+	set ^Sources("INT","*") = "int/"
+	set ^Sources("INC", "*") = "inc/"
+	set sourceControl = ..%New("")
+	set sc = $$$OK
+	set currentLocation = ##class(%SYS.Namespace).GetPackageDest($namespace, "")
+
+	// fetch all classes 
+	&sql(DECLARE classCursor cursor for
+		 SELECT ID 
+		 FROM %Dictionary.ClassDefinition 
+		 WHERE (NOT (ID %STARTSWITH '%')) 
+		 	AND NOT (ID %STARTSWITH 'Util.SourceControl') 
+		 	AND NOT (ID %STARTSWITH 'Ens') 
+		 	AND NOT (ID %STARTSWITH 'CSPX') 
+		 	AND NOT (ID %STARTSWITH 'csp') 
+		 	AND NOT (ID %STARTSWITH 'INFORMATION.SCHEMA')
+		 	AND (GeneratedBy IS NULL)
+		 	AND NOT (ID LIKE '%.xml') )
+	&sql(OPEN classCursor)
+	for {
+		&sql(FETCH classCursor INTO :className)
+		quit:(SQLCODE '= 0)
+		
+		// check for mapped files
+		set classLocation = ##class(%SYS.Namespace).GetPackageDest($namespace, className)
+		if classLocation '= currentLocation {
+			continue
+		}
+		
+		set sc = sourceControl.OnAfterSave(className _ ".cls")
+		if $$$ISERR(sc) {
+			do $system.OBJ.DisplayError(sc)
+		}
+	}
+	&sql(CLOSE classCursor)
+	
+	&sql(DECLARE deepseeCursor CURSOR FOR
+		 SELECT documentname 
+		 FROM %DeepSee_UserLibrary.FolderItem)
+	&sql(OPEN deepseeCursor)
+	for {
+		&sql(FETCH deepseeCursor INTO :name)
+		quit:(SQLCODE '= 0)
+		set sc = sourceControl.OnAfterSave(name)
+		if $$$ISERR(sc) {
+			do $system.OBJ.DisplayError(sc)
+		}
+	}
+	&sql(CLOSE deepseeCursor)
+
+	// fetch all routines
+	set st = ##class(%SQL.Statement).%New()
+	set qStatus = st.%PrepareClassQuery("%RoutineMgr","StudioOpenDialog")
+	if $$$ISOK(qStatus) {
+	 	set rs = st.%Execute("*")
+	 	
+	 	while rs.%Next() {
+	 		set fileName = rs.%GetData(1)
+	 		if ($find(fileName, ".mac")) 
+	 			|| ($find(fileName, ".int") 
+	 			|| ($find(fileName, ".DFI")) 
+	 			|| ($find(fileName, ".inc"))) {
+	 			set sc = sourceControl.OnAfterSave(fileName)
+	 			if $$$ISERR(sc) {
+	 				do $system.Status.DisplayError(sc)
+	 			}
+	 		}
+	 	}
+	}
+
+
+	// start a job - execute each RefreshTime seconds
+	if '$system.Event.Defined(..#ResourceName) {
+		job ..SearchForNewFiles()
+	}
+	
+ 	
+ 	return $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="OnAfterSave">
+<FormalSpec>InternalName:%String,Object:%RegisteredObject</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	
+	set filename=..ExternalName(InternalName)
+	
+	#; File not mapped so nothing to do
+	if filename="" quit $$$OK
+	set name=$Piece(InternalName,".",1,$Length(InternalName,".")-1)
+	
+	#; CSP files are already files so not additional work needed
+	if name["/" quit $$$OK
+	set ext=$Piece(InternalName,".",$Length(InternalName,"."))
+	
+	#; do not export the default projects
+	if ext="prj",$zconvert($extract(name,1,$length("default_")),"l")="default_" {
+		return $$$OK
+	}
+	
+	#; By convention items starting with Z,z,%z,%Z are not exported
+	if (ext="prj")||($extract($translate(name,"Z%","z"))="z") {
+		return $$$OK
+	}
+	
+	#; if time already matches nothing to do
+	// TODO
+	if ##class(%RoutineMgr).TS(InternalName)=$get(^Sources(0,"ItemTimeStamp",InternalName)) {
+		return $$$OK
+	}
+	
+	if (##class(%File).Exists(filename)) && (##class(%File).ReadOnly(filename)) {
+		write !,"File ",filename," is read only, not exporting" quit $$$OK
+	}
+	
+	do ##class(%File).CreateDirectoryChain(##class(%File).GetDirectory(filename))
+	
+	set sc = ""
+	
+	if ..#ExpMode = 2 {
+		set sc = ..ExportUDL(filename, InternalName)
+	} 
+	else {
+		set sc = $system.OBJ.Export(InternalName, filename, "-d /diffexport")
+	}
+	if $$$ISOK(sc) {
+		write !,"Exported '",InternalName,"' to file '",filename,"'"
+		set ^Sources(0,"FileTimeStamp",InternalName) = $zu(140,2,filename,1)
+		set ^Sources(0,"ItemTimeStamp",InternalName) = ##class(%RoutineMgr).TS(InternalName)
+	} else {
+		do $system.Status.DecomposeStatus(sc,,"d")
+		quit sc
+	}
+	quit $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="OnBeforeLoad">
+<FormalSpec>InternalName:%String,display:%Boolean=1</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set filename = ..ExternalName(InternalName)
+	
+	#; File not mapped so nothing to do
+	if filename = "" {
+		return $$$OK
+	}
+	
+	#; CSP files are already files so not work needed
+	if InternalName["/" {
+		return $$$OK
+	}
+	
+	#; if no file then skip the import
+	if '##class(%File).Exists(filename) {
+		 write:display !,"File ",filename," not found, skipping import" 
+		 return $$$OK
+	}
+	
+	#; if time already matches then no work to do
+	if ##class(%File).GetFileDateModified(filename,1)=$get(^Sources(0,"FileTimeStamp",InternalName)),##class(%RoutineMgr).TS(InternalName)=$get(^Sources(0,"ItemTimeStamp",InternalName)) {
+		return $$$OK
+	}
+	set name = $Piece(InternalName,".",1,$Length(InternalName,".")-1)
+	set ext = $ZConvert($Piece(InternalName,".",$Length(InternalName,".")),"U")
+	
+	set sc = ""
+	if ..#ExpMode = 2 {
+		set sc = ..ImportUDL(InternalName, filename)
+	}
+	else {
+		set sc = $system.OBJ.Load(filename,"fv-d-l")
+	}
+	if $$$ISOK(sc) {
+		write !,"Imported '",InternalName,"' from file '",filename,"'"
+		set ^Sources(0,"FileTimeStamp",InternalName) = ##class(%File).GetFileDateModified(filename,1)
+		set ^Sources(0,"ItemTimeStamp",InternalName) = ##class(%RoutineMgr).TS(InternalName)
+	} else {
+		do $system.Status.DecomposeStatus(sc,.errors,"d")
+	}
+	
+	
+	// start a job - execute each RefreshTime seconds
+	if '$system.Event.Defined(..#ResourceName) {
+		job ..SearchForNewFiles()
+	}
+	
+	return sc
+]]></Implementation>
+</Method>
+
+<Method name="ImportUDL">
+<Description>
+Import a file with location at fileLocation and name as InternalName
+This file should contain code in UDL format</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>InternalName:%String,fileLocation:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set status = $$$OK
+	
+	if $find(fileLocation, ".cls") {
+		set status = ##class(%Compiler.UDL.TextServices).SetTextFromFile($namespace, InternalName, fileLocation)
+	} 
+	
+	else {
+		set file = ##class(%File).%New(fileLocation)
+		return:$$$ISERR(file) file
+		
+		set status = file.Open()
+		return:$$$ISERR(status) status
+		
+		set rtn = ##class(%RoutineMgr).%OpenId(InternalName)
+		return:$$$ISERR(rtn) rtn
+		
+		set status = rtn.Code.CopyFrom(file)
+		return:$$$ISERR(status) status
+		
+		set status = rtn.%Save()
+	}
+	return status
+]]></Implementation>
+</Method>
+
+<Method name="GetExt">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>fileName:%String</FormalSpec>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[	return $zconvert($piece(fileName, ".", *), "l")
+]]></Implementation>
+</Method>
+
+<Method name="ExportUDL">
+<Description>
+exports fileName to fileLocation file using UDL format</Description>
+<FormalSpec>fileLocation:%String,fileName:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	#include %occErrors
+	if ('$data(fileLocation)) || ('$data(fileName)) {
+		return $$$ERROR($$$InvalidArgument, "not all fields are passed to the method")
+	}
+		
+	
+	set ext = ..GetExt(fileName)
+	
+	if ext = "cls" {
+		return ..ExportUDLClass(fileLocation, fileName)
+	} 
+	elseif (ext = "mac") || (ext = "inc") || (ext = "int") {
+		return ..ExportUDLOther(fileLocation, fileName, ext)
+	} 
+	elseif (ext = "dfi") {
+		return ..ExportUDLDFI(fileLocation, fileName)
+	}
+	return $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="ExportUDLClass">
+<Description>
+Exports a class to fileLocation with the name of fileName </Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>fileLocation:%String,fileName:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set namespace = $namespace
+	set clsformat = ".cls"
+	set status = ""
+	
+	set $piece(fileName, ".", *) = ""
+	set className = $extract(fileName, 0, * - 1) 
+	
+	// get class content
+	set status = ##class(%Compiler.UDL.TextServices).GetTextAsString(namespace, className, .classContent)
+	return:$$$ISERR(status) status
+	
+	// write class content to file
+	set fileStream = ##class(%FileCharacterStream).%New()
+	set fileStream.Filename = fileLocation
+	
+	set status = fileStream.Write(classContent)
+	return:$$$ISERR(status) status
+	
+	set status = fileStream.SaveStream()
+	return status
+]]></Implementation>
+</Method>
+
+<Method name="ExportUDLOther">
+<Description>
+Exports .mac, .inc files to fileLocation with the name of fileName</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>fileLocation:%String,fileName:%String,ext:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set rtn = ##class(%RoutineMgr).%OpenId(fileName)
+ 	
+ 	// write content to file
+	set fileStream = ##class(%FileCharacterStream).%New()
+	set fileStream.Filename = fileLocation
+	
+	// transform routine.mac -> routine
+	set routineName = $extract(fileName, 0, $find(fileName, ".") - 2)
+	
+	if ext = "mac" {
+		do fileStream.WriteLine("ROUTINE " _ routineName)
+	} elseif ext = "inc" {
+		do fileStream.WriteLine("ROUTINE " _ routineName _ " [Type=INC]")
+	} elseif ext = "int" {
+		do fileStream.WriteLine("ROUTINE " _ routineName _ " [Type=INT,Generated]")
+	}
+	
+	while 'rtn.Code.AtEnd {
+		do fileStream.WriteLine(rtn.Code.ReadLine())
+	}
+	
+	do fileStream.%Save()
+		
+	return $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="ExportUDLDFI">
+<ClassMethod>1</ClassMethod>
+<FormalSpec>fileLocation:%String,fileName:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set rtn = ##class(%RoutineMgr).%OpenId(fileName)
+ 	
+ 	// write content to file
+	set fileStream = ##class(%FileCharacterStream).%New()
+	set fileStream.Filename = fileLocation
+	
+	set status = fileStream.CopyFromAndSave(rtn.Code)
+	return:$$$ISERR(status) status
+	
+	return status
+]]></Implementation>
+</Method>
+
+<Method name="ExtName">
+<Description>
+Return filename of this item</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>InternalName:%String</FormalSpec>
+<Private>1</Private>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[
+	set name = ..Name(InternalName)	
+	if ..#ExpMode = 2 {
+		set $piece(name, ".", *) = $zconvert($piece(InternalName, ".", *), "l")
+	}
+	return $select(name="":"",1:^Sources_$translate(name,"\","/"))
+]]></Implementation>
+</Method>
+
+<Method name="Name">
+<Description>
+Return the name of this item without the prefix to be added by ExtName</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>InternalName:%String</FormalSpec>
+<Private>1</Private>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[
+	if $data(^Sources)'=11 Write !,"^Sources is not setup so hooks will not work" quit ""
+		
+	// for an abstract document, use the GetOther() method to try to determine its "real" class
+	if ##class(%RoutineMgr).UserType(InternalName,.docclass,.doctype) {
+		// Check for a real abstract document subclass (or GetOther() may not work)
+		if $classmethod(docclass,"%IsA","%Studio.AbstractDocument") {
+			// Grab the actual name
+			set actualName = $classmethod(docclass,"GetOther",InternalName)
+			// The actualName is only valid if we get a single .cls as a result
+			if actualName'[",",$ZCVT($P(actualName,".",$L(actualName,".")),"U")="CLS" {
+				// We use what GetOther() gives us, thus Demo.Loan.FindRateProcess.bpl becomes Demo.Loan.FindRateProcess.cls
+				set InternalName = actualName
+			}
+		}
+	}	
+	
+	if $$CheckProtect^%qccServer(InternalName) quit ""
+	set nam=$p(InternalName,".",1,$l(InternalName,".")-1),ext=$p(InternalName,".",$l(InternalName,".")),ext=$zcvt(ext,"u")
+	if nam="" quit ""
+	if ext="PRJ",nam["Default_" quit ""
+	if ext="CLS",$$$defClassKeyGet(nam,$$$cCLASSgeneratedby)'="" quit ""
+	set default=0
+	set p=$order(^Sources(ext,nam)) for  s p=$order(^Sources(ext,p),-1) quit:p=""  if $extract(nam,1,$length(p))=p,$data(^Sources(ext,p),found) quit
+	
+	if $data(found)=0,$data(^Sources(ext,"*"),found) set default=1
+	if $data(found)=0 quit ""
+	if InternalName["/" {
+		set InternalName=$extract(InternalName,$length(p)+1,*)
+		return $translate(found_$translate(InternalName,"%","_"),"\","/")
+	}
+	if ext="CLS"||(ext="PRJ")||(##class(%RoutineMgr).UserType(InternalName)) {
+		if ext = "DFI" {
+			set fileLocation = found _ nam
+		}
+		else {
+			set fileLocation = found _ $translate(nam, ".%", "/")
+		}
+		if ..#ExpMode = 0 {
+			set fileLocation = fileLocation _ ".xml"
+		}
+		elseif ..#ExpMode = 1 {
+			set fileLocation = fileLocation _ "." _ $zconvert(ext, "l") _".xml"
+		} 
+		else {
+			set fileLocation = fileLocation _ "." _ $zconvert(ext, "l")
+		}
+		set fileLocation = $translate(fileLocation, "\", "/")
+		return fileLocation
+	}
+	return $translate($g(found)_$tr(nam,"%"_$s(default:".",1:""),"_/")_".xml","\","/")
+]]></Implementation>
+</Method>
+
+<Method name="SearchForNewFiles">
+<Description>
+Searches for new files(files that are not in project) in source control directory
+Is executed on another process</Description>
+<ClassMethod>1</ClassMethod>
+<Implementation><![CDATA[
+	if '$system.Event.Defined(..#ResourceName) {
+		do $system.Event.Create(..#ResourceName)
+	}
+	for {
+		do $system.Event.Wait(..#ResourceName, ..#RefreshTime)
+		set dir = ^Sources
+		do ##class(Util.SourceControl).TraverseFileTree(dir)
+	}
+]]></Implementation>
+</Method>
+
+<Method name="GetInternalName">
+<Description>
+Gets the name of a file at fileLocation</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>fileLocation:%String</FormalSpec>
+<ReturnType>%String</ReturnType>
+<Implementation><![CDATA[
+	set defLocation = $translate(^Sources, "/", "\")
+	set internalName = $translate($extract(fileLocation, $find(fileLocation, defLocation) + 4, *), "\", ".")
+	return internalName
+]]></Implementation>
+</Method>
+
+<Method name="TraverseFileTree">
+<Description>
+Traverses the file tree starting at source control directory</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec>dir:%String</FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set list = ""
+	set trs = ##class(%ResultSet).%New("%Library.File:FileSet")
+ 	set tsc = trs.Execute(dir, "*")
+	while trs.Next() {
+		set name = trs.Get("Name")
+ 		set type = trs.Get("Type")
+ 		if type = "D" {
+ 			do ..TraverseFileTree(name)
+ 		}
+ 		else {
+	 		set internalName = ..GetInternalName(name)
+	 		set internalNameUpper = internalName
+	 		set $piece(internalNameUpper, ".", *) = $zconvert($piece(internalNameUpper, ".", *), "U")
+ 			if ('$data(^Sources(0, "FileTimeStamp", internalName))) 
+ 				&& ('$data(^Sources(0, "FileTimeStamp", internalNameUpper))) {
+	 			write !, name
+				set st = ..CreateFile(internalName, name, .list)
+				if $$$ISERR(st) {
+					do $system.Status.DisplayError(st)
+				}
+	 		}
+ 		}
+ 	}
+ 	do $system.OBJ.CompileList(.list, "cuk /checkuptodate=expandedonly")
+ 	return $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="CreateFile">
+<Description>
+Creates new file with the name of internalName which is stored at fileLocation</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec><![CDATA[internalName:%String,fileLocation:%String,&list]]></FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set st = ""
+	if $find(fileLocation, "\cls\") {
+		set st = ..CreateClass(internalName, fileLocation, .list)
+	}
+	elseif $find(fileLocation, "\dfi\") {
+		set st = ..CreateDFI(internalName, fileLocation, .list)
+	} 
+	else {
+		set st = ..CreateOther(internalName, fileLocation, .list)
+	}
+	return $$$OK
+]]></Implementation>
+</Method>
+
+<Method name="CreateClass">
+<Description>
+Creates a class with the name of internalName which is stored at fileLocation</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec><![CDATA[internalName:%String,fileLocation:%String,&list]]></FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set clsDef = ##class(%Dictionary.ClassDefinition).%New()
+	set clsDef.Name = $replace(internalName, ".cls", "")
+	set st = clsDef.%Save()
+	return:$$$ISERR(st) st
+	
+	set st = ..ImportUDL(internalName, fileLocation)
+	set list(internalName) = ""
+	return st
+]]></Implementation>
+</Method>
+
+<Method name="CreateDFI">
+<ClassMethod>1</ClassMethod>
+<FormalSpec><![CDATA[internalName:%String,fileLocation:%String,&list]]></FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set st = $$$OK
+    try {
+        set stream = ##class(%Stream.FileCharacter).%New()
+        set st = stream.LinkToFile(fileLocation)
+        return:$$$ISERR(st) st
+        
+        set tDoc = ##class(%DeepSee.UI.FolderItemDocument).%New(internalName)
+        set st = tDoc.ImportFromXML(stream)
+        return:$$$ISERR(st) st
+        
+        set st = tDoc.Save()
+        return:$$$ISERR(st) st
+    } Catch e {
+        set st = e.AsStatus()
+    }
+    return st
+]]></Implementation>
+</Method>
+
+<Method name="CreateOther">
+<Description>
+Creates .mac, .int, .dfi file with the name of intrernalName which is stored at fileLocation</Description>
+<ClassMethod>1</ClassMethod>
+<FormalSpec><![CDATA[internalName:%String,fileLocation:%String,&list]]></FormalSpec>
+<ReturnType>%Status</ReturnType>
+<Implementation><![CDATA[
+	set fileLocation = $translate(fileLocation, "\", "/")
+	set $piece(internalName, ".", *) = $zconvert($piece(internalName, ".", *), "U")
+	
+	set file = ##class(%File).%New(fileLocation)
+	
+	set rtn = ##class(%Routine).%New(internalName)
+	set status = rtn.CopyFrom(file)
+	return:$$$ISERR(status) status
+	
+	set status = rtn.Save()
+ 	return:$$$ISERR(status) status
+ 	
+ 	set list(internalName) = ""
+ 	return status
+]]></Implementation>
+</Method>
+</Class>
+</Export>
